@@ -367,3 +367,29 @@ def multi_scale_ncc(kgr, ktvt, hgr, hws=(8, 15, 25), stride=3):
     sw = np.exp(3. * scores); sw /= sw.sum(1, keepdims=True) + 1e-9
     sc_ens = (tvts * sw).sum(1).astype(np.float32)
     return out, sc_ens
+
+def affine_cal(kgr, tw_at_k, min_pts=20):
+    """Calculates scale (a) and shift (b) between well GR and typewell GR."""
+    kgr = np.asarray(kgr, float)
+    tw_at_k = np.asarray(tw_at_k, float)
+    v = np.isfinite(kgr) & np.isfinite(tw_at_k)
+    if v.sum() < min_pts or np.std(tw_at_k[v]) < 1e-6:
+        return 1.0, float(np.nanmean(kgr[v]) - np.nanmean(tw_at_k[v])) if v.any() else 0.0
+    a, b = np.polyfit(tw_at_k[v], kgr[v], 1)
+    return float(a), float(b)
+
+def seg_b_well(ktvt, kz, form_col):
+    """Calculates formation offsets for early, mid, late, and WLS segments."""
+    bv = ktvt + kz - form_col
+    n = len(bv)
+    b_full = float(np.median(bv))
+    b_late = float(np.median(bv[max(0, n-50):])) if n >= 5 else b_full
+    t1, t2 = n // 3, 2 * n // 3
+    b_early = float(np.median(bv[:max(1, t1)])) if t1 > 0 else b_full
+    b_mid = float(np.median(bv[t1:max(t1+1, t2)])) if t2 > t1 else b_full
+    
+    # Weighted Least Squares (exponentially favors recent points)
+    w = np.exp(0.02 * np.arange(n))
+    w /= w.sum()
+    b_wls = float(np.dot(w, bv))
+    return b_full, b_early, b_mid, b_late, b_wls

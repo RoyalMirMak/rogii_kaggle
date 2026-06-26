@@ -7,7 +7,8 @@ from sklearn.model_selection import GroupKFold
 from tqdm import tqdm
 
 from src.utils import setup_logger
-from src.model import LGBMWrapper
+from src.model import LGBMWrapper, CatBoostWrapper
+from sklearn.linear_model import Ridge
 
 class Trainer:
     def __init__(self, config, feature_cols):
@@ -37,8 +38,10 @@ class Trainer:
         y = train_df["target_residual"].astype(np.float32).values
         groups = train_df["well_id"].values
         
-        oof_residuals = np.zeros(len(train_df), dtype=np.float64)
-        fold_models = []
+        oof_lgb = np.zeros(len(train_df), dtype=np.float64)
+        oof_cb = np.zeros(len(train_df), dtype=np.float64)
+        fold_models_lgb = []
+        fold_models_cb = []
         
         gkf = GroupKFold(n_splits=self.n_folds)
         fold_splits = list(gkf.split(X, y, groups))
@@ -55,40 +58,59 @@ class Trainer:
             valid_wells = len(np.unique(groups[valid_idx]))
             self.logger.info(f"Train samples: {len(train_idx):,} ({train_wells} wells) | Valid samples: {len(valid_idx):,} ({valid_wells} wells)")
             
-            # Initialize and train model
-            model = LGBMWrapper(self.config)
-            model.fit(X_train, y_train, X_valid, y_valid, self.feature_cols)
+            # 1. Train LightGBM
+            self.logger.info("Training LightGBM...")
+            model_lgb = LGBMWrapper(self.config)
+            model_lgb.fit(X_train, y_train, X_valid, y_valid, self.feature_cols)
+            pred_lgb = model_lgb.predict(X_valid)
+            oof_lgb[valid_idx] = pred_lgb
             
-            # Generate validation predictions (residuals)
-            pred_residuals = model.predict(X_valid)
-            oof_residuals[valid_idx] = pred_residuals
+            model_path_lgb = self.artifacts_dir / f"lgbm_fold_{fold + 1}.txt"
+            model_lgb.save(str(model_path_lgb))
+            fold_models_lgb.append(model_lgb)
             
-            # Save fold model
-            model_path = self.artifacts_dir / f"lgbm_fold_{fold + 1}.txt"
-            model.save(str(model_path))
-            fold_models.append(model)
+            # 2. Train CatBoost
+            self.logger.info("Training CatBoost...")
+            model_cb = CatBoostWrapper(self.config)
+            model_cb.fit(X_train, y_train, X_valid, y_valid, self.feature_cols)
+            pred_cb = model_cb.predict(X_valid)
+            oof_cb[valid_idx] = pred_cb
             
-            # Calculate and log isolated fold residual RMSE
-            rmse_res = float(np.sqrt(np.mean((pred_residuals - y_valid)**2)))
-            fold_time = time.time() - fold_start
-            self.logger.info(f"Fold {fold + 1} Residual RMSE: {rmse_res:.4f} (completed in {fold_time:.1f}s)")
+            model_path_cb = self.artifacts_dir / f"cb_fold_{fold + 1}.cbm"
+            model_cb.save(str(model_path_cb))
+            fold_models_cb.append(model_cb)
+            
+            # Log Fold Metrics
+            rmse_lgb = float(np.sqrt(np.mean((pred_lgb - y_valid)**2)))
+            rmse_cb = float(np.sqrt(np.mean((pred_cb - y_valid)**2)))
+            self.logger.info(f"Fold {fold + 1} RMSE | LGBM: {rmse_lgb:.4f} | CB: {rmse_cb:.4f}")
             
         self.logger.info(f"All {self.n_folds} folds completed.")
         
-        # --- NEW: Save feature columns for the Kaggle inference notebook ---
+        # 3. Train Meta-Learner (Ridge Stacking)
+        self.logger.info("Training Ridge Meta-Learner on OOF predictions...")
+        meta_X = np.column_stack([oof_lgb, oof_cb])
+        meta_model = Ridge(alpha=10.0)
+        meta_model.fit(meta_X, y)
+        
+        final_oof = meta_model.predict(meta_X)
+        meta_rmse = float(np.sqrt(np.mean((final_oof - y)**2)))
+        self.logger.info(f"Meta-Learner OOF RMSE: {meta_rmse:.4f}")
+        self.logger.info(f"Meta-Learner Weights (LGBM, CB): {meta_model.coef_}")
+        
+        # Save Meta-Learner Weights and features
+        np.save(self.artifacts_dir / "meta_weights.npy", meta_model.coef_)
+        np.save(self.artifacts_dir / "meta_intercept.npy", np.array([meta_model.intercept_]))
+        
         feature_cols_path = self.artifacts_dir / "feature_cols.txt"
         with open(feature_cols_path, "w") as f:
             for col in self.feature_cols:
                 f.write(col + "\n")
-        self.logger.info(f"Saved {len(self.feature_cols)} feature names to {feature_cols_path}")
+                
+        # Save OOF
+        train_df["oof_pred_lgb"] = oof_lgb
+        train_df["oof_pred_cb"] = oof_cb
+        train_df["oof_pred"] = final_oof
+        train_df[["well_id", "row_index", "target_residual", "oof_pred_lgb", "oof_pred_cb", "oof_pred", "md_from_ps"]].to_csv(self.artifacts_dir / "oof_preds.csv", index=False)
         
-        # --- NEW: Save OOF predictions to CSV for analysis ---
-        train_df["oof_pred"] = oof_residuals
-        oof_path = self.artifacts_dir / "oof_preds.csv"
-        # Only save columns necessary for analysis to keep file size small
-        save_cols = ["well_id", "row_index", "target_residual", "oof_pred", "md_from_ps", "z_from_ps"]
-        train_df[save_cols].to_csv(oof_path, index=False)
-        self.logger.info(f"Saved OOF predictions to {oof_path}")
-        # -------------------------------------------------------------------
-        
-        return fold_models, oof_residuals, train_df
+        return fold_models_lgb, final_oof, train_df

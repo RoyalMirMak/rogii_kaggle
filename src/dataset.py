@@ -9,6 +9,7 @@ import sys
 
 from src.utils import setup_logger, robust_slope, first_nan_idx
 from src.physics import FormationPlaneKNN, DenseANCCImputer, beam_search, self_corr_tvt, multi_scale_ncc, run_pf_ancc
+from src.physics import multi_scale_ncc, run_pf_ancc, seg_b_well, affine_cal
 
 class DatasetBuilder:
     def __init__(self, config):
@@ -162,26 +163,68 @@ class DatasetBuilder:
             cur["pf_ancc_d"] = 0.0
             cur["pf_ancc_std"] = 0.0
 
-        # We keep the Dense ANCC Imputation (because it had 36% importance)
-        # BUT we DELETE the old 0% importance KNN to save compute
+        # --- Dense ANCC Imputation with Segmented b_well ---
         xy_kn = visible[["X", "Y"]].to_numpy()
         xy_ev = cur[["X", "Y"]].to_numpy()
         d_ancc = self.dense_knn.impute(xy_ev, self_wid=wid if split == "train" else None)
         d_kn = self.dense_knn.impute(xy_kn, self_wid=wid if split == "train" else None)
         
-        b_vd = vis_TVT + visible["Z"].to_numpy() - d_kn
-        b_d = float(np.median(b_vd)) if len(b_vd) > 0 else 0.0
-        cur["tvt_dense_d"] = (-cur["Z"].values + d_ancc + b_d) - last_TVT
+        ktvt = visible["TVT_input"].to_numpy(dtype=np.float32)
+        kz = visible["Z"].to_numpy(dtype=np.float32)
+        z_ev = cur["Z"].to_numpy(dtype=np.float32)
+
+        # Calculate early, mid, late, and exponentially weighted offsets
+        b_full, b_early, b_mid, b_late, b_wls = seg_b_well(ktvt, kz, d_kn)
         
-        # Cross-signal features (High Value!)
-        if has_tw and len(pf_a_pts) == len(cur):
+        cur["tvt_dense_d"]   = (-z_ev + d_ancc + b_full) - last_TVT
+        cur["tvt_densew_d"]  = (-z_ev + d_ancc + b_wls) - last_TVT
+        cur["tvt_dense50_d"] = (-z_ev + d_ancc + b_late) - last_TVT
+        
+        # Cross-signal features
+        if has_tw and "pf_ancc_d" in cur:
             cur["pf_vs_dense"] = cur["pf_ancc_d"] - cur["tvt_dense_d"]
             cur["sc_vs_dense"] = cur["sc_ens_d"] - cur["tvt_dense_d"]
             cur["pf_vs_beam"] = cur["pf_ancc_d"] - cur["beam_mean_d"]
         else:
-            cur["pf_vs_dense"] = 0.0
-            cur["sc_vs_dense"] = 0.0
-            cur["pf_vs_beam"] = 0.0
+            cur["pf_vs_dense"] = 0.0; cur["sc_vs_dense"] = 0.0; cur["pf_vs_beam"] = 0.0
+        
+                # --- GR Offset Matrices and Affine Calibration ---
+        if has_tw:
+            # 1. Affine Calibration (Scale and Shift of GR)
+            tw_at_k = np.interp(ktvt, tw_tvt, tw_gr).astype(np.float32)
+            a_cal, b_cal = affine_cal(kgr, tw_at_k)
+            cur["cal_a"] = a_cal
+            cur["cal_b"] = b_cal
+            
+            # 2. GR Offset Matrices
+            # How much does the well GR deviate from the typewell GR at multiple offsets around our physics predictions?
+            # Note: tdsc_* (NCC offsets) removed - they had 0.00% feature importance
+            ANCH_OFFS = [-80, -40, -20, -10, -5, 0, 5, 10, 20, 40, 80]
+            BEAM_OFFS = [-40, -20, -10, -5, -3, 0, 3, 5, 10, 20, 40]
+            PF_OFFS   = [-30, -15, -8, -4, -2, 0, 2, 4, 8, 15, 30]
+
+            # Anchor Offsets (around last known TVT)
+            for o in ANCH_OFFS:
+                cur[f"tda_{o}"] = hgr - np.interp(last_TVT + o, tw_tvt, tw_gr)
+            
+            # Beam Offsets (around Beam Search Mean)
+            beam_ref = cur["beam_mean_d"].values + last_TVT
+            for o in BEAM_OFFS:
+                cur[f"tdbc_{o}"] = hgr - np.interp(beam_ref + o, tw_tvt, tw_gr)
+                
+            # PF Offsets (around Particle Filter)
+            if "pf_ancc_d" in cur and (cur["pf_ancc_d"] != 0).any():
+                pf_ref = cur["pf_ancc_d"].values + last_TVT
+                for o in PF_OFFS:
+                    cur[f"tdpf_{o}"] = hgr - np.interp(pf_ref + o, tw_tvt, tw_gr)
+            else:
+                for o in PF_OFFS: cur[f"tdpf_{o}"] = 0.0
+
+        else:
+            cur["cal_a"] = 1.0; cur["cal_b"] = 0.0
+            for o in [-80, -40, -20, -10, -5, 0, 5, 10, 20, 40, 80]: cur[f"tda_{o}"] = 0.0
+            for o in [-40, -20, -10, -5, -3, 0, 3, 5, 10, 20, 40]: cur[f"tdbc_{o}"] = 0.0
+            for o in [-30, -15, -8, -4, -2, 0, 2, 4, 8, 15, 30]: cur[f"tdpf_{o}"] = 0.0
 
         # --- 3. Target Variable Setup ---
         if split == "train":

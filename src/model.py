@@ -3,6 +3,11 @@ import lightgbm as lgb
 from pathlib import Path
 import sys
 
+try:
+    from catboost import CatBoostRegressor
+except ImportError:
+    CatBoostRegressor = None
+
 class LGBMWrapper:
     def __init__(self, config):
         self.params = config["model"]["params"]
@@ -74,4 +79,44 @@ class LGBMWrapper:
     def load(self, filepath):
         """Loads a trained booster from disk."""
         self.booster = lgb.Booster(model_file=filepath)
+        return self
+
+
+class CatBoostWrapper:
+    def __init__(self, config):
+        # We hardcode optimal parameters for this specific geology task
+        self.params = {
+            'iterations': 3000,
+            'learning_rate': 0.03,
+            'depth': 6,
+            'loss_function': 'RMSE',
+            'eval_metric': 'RMSE',
+            'random_seed': 42,
+            'verbose': 200,
+            'early_stopping_rounds': 150,
+            'task_type': 'CPU'  # Change to GPU if your environment supports it
+        }
+        self.model = None
+
+    def fit(self, X_train, y_train, X_valid, y_valid, feature_names):
+        if CatBoostRegressor is None:
+            raise ImportError(
+                "catboost is not installed. Please run: pip install catboost"
+            )
+        self.model = CatBoostRegressor(**self.params)
+        self.model.fit(
+            X_train, y_train,
+            eval_set=(X_valid, y_valid)
+        )
+        return self
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+    def save(self, filepath):
+        self.model.save_model(filepath)
+
+    def load(self, filepath):
+        self.model = CatBoostRegressor()
+        self.model.load_model(filepath)
         return self
