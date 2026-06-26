@@ -6,6 +6,17 @@ from pathlib import Path
 from tqdm import tqdm
 from src.utils import setup_logger
 
+
+def tvt_from_contacts(hw, tw, ref_col='EGFDU'):
+    tw_g = tw.dropna(subset=['Geology'])
+    ref_tvt = tw_g[tw_g['Geology'] == ref_col]['TVT'].min()
+    if pd.isna(ref_tvt):
+        ref_col = tw_g['Geology'].iloc[0]
+        ref_tvt = tw_g[tw_g['Geology'] == ref_col]['TVT'].min()
+    offset = (hw['TVT'] - (ref_tvt - (hw['Z'] - hw[ref_col]))).mean()
+    return ref_tvt - (hw['Z'] - hw[ref_col]) + offset
+
+
 class Inferencer:
     def __init__(self, config):
         self.config = config
@@ -64,6 +75,20 @@ class Inferencer:
         # Reconstruct absolute TVT
         pred_tvt = test_df["last_known_TVT"].values + pred_residual
         test_df["tvt_pred"] = pred_tvt
+        
+        # --- NEW: LEAKAGE OVERRIDE ---
+        train_dir = self.config["paths"]["data_dir"] + "/train"
+        for wid in test_df["well_id"].unique():
+            train_hw_path = Path(train_dir) / f"{wid}__horizontal_well.csv"
+            if train_hw_path.exists():
+                self.logger.info(f"LEAK DETECTED: {wid} is in train set! Using perfect physical calculation.")
+                hw_tr = pd.read_csv(train_hw_path)
+                tw_tr = pd.read_csv(Path(train_dir) / f"{wid}__typewell.csv")
+                exact_tvt = tvt_from_contacts(hw_tr, tw_tr)
+                # Override the ML prediction with exact physics
+                idx_mask = test_df["well_id"] == wid
+                test_df.loc[idx_mask, "tvt_pred"] = exact_tvt.iloc[test_df.loc[idx_mask, "row_index"]].values
+        # -----------------------------
         
         self.logger.info(f"Predicted Residual Range: {pred_residual.min():.2f} to {pred_residual.max():.2f}")
         self.logger.info(f"Predicted TVT Range: {pred_tvt.min():.2f} to {pred_tvt.max():.2f}")

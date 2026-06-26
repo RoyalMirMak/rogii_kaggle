@@ -1,6 +1,9 @@
 # src/physics.py
 import numpy as np
 from pathlib import Path
+from scipy.spatial import cKDTree
+import pandas as pd
+from numba import njit
 
 class FormationPlaneKNN:
     def __init__(self, train_wells, data_dir, formations):
@@ -115,6 +118,42 @@ class FormationPlaneKNN:
                     
         return form_z, knn_dist
 
+
+class DenseANCCImputer:
+    def __init__(self, train_wells, data_dir, spw=60):
+        xs, ys, anccs, wids = [], [], [], []
+        for wid in train_wells:
+            p = Path(data_dir) / f'train/{wid}__horizontal_well.csv'
+            try: 
+                df = pd.read_csv(p, usecols=['X', 'Y', 'ANCC']).dropna()
+                if len(df) == 0: continue
+                # Sample points along the wellbore
+                ix = np.linspace(0, len(df)-1, min(spw, len(df)), dtype=int)
+                s = df.iloc[ix]
+                xs.append(s['X'].values); ys.append(s['Y'].values)
+                anccs.append(s['ANCC'].values); wids.extend([wid]*len(s))
+            except: continue
+        self.xy = np.column_stack([np.concatenate(xs), np.concatenate(ys)])
+        self.ancc = np.concatenate(anccs).astype(np.float32)
+        self.wids = np.array(wids)
+        self.scale = np.where(self.xy.std(0) < 1e-3, 1., self.xy.std(0))
+        self.tree = cKDTree(self.xy / self.scale)
+
+    def impute(self, xy_q, self_wid=None, k=20):
+        xy_q = np.atleast_2d(xy_q); q = xy_q / self.scale
+        dist, idx = self.tree.query(q, k=k+5, workers=-1)
+        if self_wid: dist = np.where(self.wids[idx] == self_wid, np.inf, dist)
+        ord_idx = np.argpartition(dist, k-1, axis=1)[:, :k]
+        dk = np.take_along_axis(dist, ord_idx, 1)
+        ik = np.take_along_axis(idx, ord_idx, 1)
+        vk = np.isfinite(dk)
+        w = np.where(vk, 1./(dk + 1e-3), 0.)
+        sw = w.sum(1); safe = np.where(sw < 1e-9, 1., sw)
+        ap = (self.ancc[ik] * w).sum(1) / safe
+        ap = np.where(sw < 1e-9, float(self.ancc.mean()), ap)
+        return ap.astype(np.float32)
+
+
 def beam_search(hgr, tw_tvt, tw_gr, last_TVT, beam_size=10, move_cost=20.0, emit_scale=144.0, smooth_radius=2):
     """Vectorized NumPy Beam Search with Viterbi Backpointers (Zero Memory Bottleneck)"""
     N = len(hgr)
@@ -211,3 +250,120 @@ def self_corr_tvt(kgr, vis_TVT, hgr, hw=15, stride=3):
     path = np.full(N, base_tvt + best_lag * tvt_step, dtype=np.float64)
     
     return path, best_score
+
+
+# --- GLOBAL CONSTANTS FOR PARTICLE FILTER ---
+PF_N=600; ANCC_N=600
+PF_MOM=0.993; PF_VN=0.005; PF_PN=0.01
+PF_GR_SIG_MIN=10.; PF_GR_SIG_MAX=60.; PF_GR_SIG_DEF=30.
+PF_INIT_V_STD=0.02; PF_INIT_SPR=0.5; PF_RESAMP=0.5
+PF_ROUGH_P=0.2; PF_ROUGH_V=0.003; PF_GR_WIN=5; PF_GR_WT=0.3
+ANCC_ALPHA=0.998; ANCC_RN=0.002; ANCC_PN=0.005
+ANCC_IR=0.01; ANCC_IS=0.3; ANCC_RP=0.1; ANCC_RR=0.001
+
+@njit(cache=True)
+def _interp1(grid, v, vmin, step):
+    i = int((v - vmin) / step)
+    if i < 0: return grid[0]
+    n = len(grid) - 1
+    if i >= n: return grid[n]
+    t = (v - vmin) / step - i
+    return grid[i]*(1.-t) + grid[i+1]*t
+
+@njit(cache=True)
+def _resamp(pos, aux, w, N, rp, rv):
+    cum = np.zeros(N+1)
+    for j in range(N): cum[j+1] = cum[j] + w[j]
+    u0 = np.random.uniform(0., 1./N)
+    np2 = np.empty(N); na = np.empty(N); ci = 0
+    for j in range(N):
+        u = u0 + j/N
+        while ci < N-1 and cum[ci+1] < u: ci += 1
+        np2[j] = pos[ci] + rp * np.random.randn()
+        na[j]  = aux[ci] + rv * np.random.randn()
+    return np2, na
+
+@njit(cache=True)
+def _pf_ancc(md_v, z_v, gr_v, gg, vmin, step, gs, ls, ir, N, ALPHA, RN, PN, IS, RP, RR, RESAMP):
+    pos = np.empty(N); rate = np.empty(N); w = np.ones(N)/N
+    for j in range(N):
+        pos[j] = ls + IS * np.random.randn()
+        rate[j] = ir + 0.01 * np.random.randn()
+    pts = np.empty(len(md_v)); std_ = np.empty(len(md_v)); pm = md_v[0] - 1.
+    for i in range(len(md_v)):
+        dm = max(md_v[i] - pm, 1.)
+        for j in range(N):
+            rate[j] = ALPHA * rate[j] + RN * np.random.randn()
+            pos[j] += rate[j] * dm + PN * np.random.randn()
+            tvt_j = pos[j] - z_v[i]
+            tvt_j = max(tvt_j, vmin - 50.); tvt_j = min(tvt_j, vmin + len(gg)*step + 50.)
+            pos[j] = tvt_j + z_v[i]
+        if not np.isnan(gr_v[i]):
+            ws = 0.
+            for j in range(N):
+                eg = _interp1(gg, pos[j] - z_v[i], vmin, step)
+                d = (gr_v[i] - eg) / gs
+                lk = max(np.exp(-0.5 * d * d) if d * d < 600. else 0., 1e-300)
+                w[j] *= lk; ws += w[j]
+            for j in range(N): w[j] = w[j]/ws if ws > 0. else 1./N
+        ne = 0.
+        for j in range(N): ne += w[j]*w[j]
+        if 1./ne < RESAMP * N:
+            pos, rate = _resamp(pos, rate, w, N, RP, RR)
+            for j in range(N): w[j] = 1./N
+        tv = 0.; va = 0.
+        for j in range(N): tv += w[j] * (pos[j] - z_v[i])
+        pts[i] = tv
+        for j in range(N): va += w[j] * (pos[j] - z_v[i] - tv)**2
+        std_[i] = va**0.5; pm = md_v[i]
+    return pts, std_
+
+def _grid(tw_tvt, tw_gr, step=0.2):
+    tmin = float(tw_tvt.min()); tmax = float(tw_tvt.max())
+    tvt_g = np.arange(tmin, tmax + step, step)
+    return np.interp(tvt_g, tw_tvt, tw_gr).astype(np.float64), float(tmin), float(step)
+
+def _gr_sig(hw, tw_tvt, tw_gr):
+    kn = hw[hw['TVT_input'].notna() & hw['GR'].notna()]
+    if len(kn) < 20: return float(PF_GR_SIG_DEF)
+    return float(np.clip(np.std(kn['GR'].values - np.interp(kn['TVT_input'].values, tw_tvt, tw_gr)), PF_GR_SIG_MIN, PF_GR_SIG_MAX))
+
+def run_pf_ancc(hw, tw_tvt, tw_gr, N=ANCC_N):
+    gs = _gr_sig(hw, tw_tvt, tw_gr)
+    kn = hw[hw['TVT_input'].notna()]; ev = hw[hw['TVT_input'].isna()]
+    if len(ev) == 0: return np.array([]), np.array([])
+    ls = float(kn['TVT_input'].iloc[-1] + kn['Z'].iloc[-1])
+    tail = kn.tail(30); dt = np.diff(tail['TVT_input'].values)
+    dz = np.diff(tail['Z'].values); dm = np.diff(tail['MD'].values); m = dm > 0
+    ir = float(np.median((dt + dz)[m] / dm[m])) if m.sum() >= 3 else 0.
+    gg, gmin, gst = _grid(tw_tvt, tw_gr)
+    
+    gr_interp = ev['GR'].interpolate(limit_direction='both').fillna(np.nanmean(tw_gr))
+    pts, std = _pf_ancc(ev['MD'].values.astype(np.float64), ev['Z'].values.astype(np.float64),
+                      gr_interp.values.astype(np.float64), gg, gmin, gst,
+                      gs, ls, ir, N, ANCC_ALPHA, ANCC_RN, ANCC_PN, ANCC_IS, ANCC_RP, ANCC_RR, PF_RESAMP)
+    return pts.astype(np.float32), std.astype(np.float32)
+
+def multi_scale_ncc(kgr, ktvt, hgr, hws=(8, 15, 25), stride=3):
+    out = []
+    for hw in hws:
+        win = 2 * hw + 1; nk = len(kgr); nh = len(hgr)
+        if nk < win + 1 or nh == 0:
+            out.append((np.full(nh, ktvt[-1], np.float32), np.zeros(nh, np.float32))); continue
+        kg = pd.Series(kgr).rolling(5, center=True, min_periods=1).mean().values.astype(np.float32)
+        hg = pd.Series(hgr).rolling(5, center=True, min_periods=1).mean().values.astype(np.float32)
+        sts = np.arange(0, nk - win + 1, stride, dtype=np.int32)
+        if len(sts) == 0:
+            out.append((np.full(nh, ktvt[-1], np.float32), np.zeros(nh, np.float32))); continue
+        C = kg[sts[:, None] + np.arange(win, dtype=np.int32)[None, :]].astype(np.float32)
+        Cn = (C - C.mean(1, keepdims=True)) / (C.std(1, keepdims=True) + 1e-6)
+        hp = np.pad(hg, hw, mode='edge')
+        H = hp[np.arange(nh)[:, None] + np.arange(win)[None, :]].astype(np.float32)
+        Hn = (H - H.mean(1, keepdims=True)) / (H.std(1, keepdims=True) + 1e-6)
+        ncc = Hn @ Cn.T / win; best = ncc.argmax(1); score = ncc.max(1).astype(np.float32)
+        out.append((ktvt[np.clip(sts[best] + hw, 0, nk - 1)].astype(np.float32), score))
+    
+    tvts = np.stack([o[0] for o in out], 1); scores = np.stack([o[1] for o in out], 1)
+    sw = np.exp(3. * scores); sw /= sw.sum(1, keepdims=True) + 1e-9
+    sc_ens = (tvts * sw).sum(1).astype(np.float32)
+    return out, sc_ens

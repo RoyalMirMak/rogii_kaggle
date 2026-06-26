@@ -74,4 +74,21 @@ class Trainer:
             self.logger.info(f"Fold {fold + 1} Residual RMSE: {rmse_res:.4f} (completed in {fold_time:.1f}s)")
             
         self.logger.info(f"All {self.n_folds} folds completed.")
+        
+        # --- NEW: Save feature columns for the Kaggle inference notebook ---
+        feature_cols_path = self.artifacts_dir / "feature_cols.txt"
+        with open(feature_cols_path, "w") as f:
+            for col in self.feature_cols:
+                f.write(col + "\n")
+        self.logger.info(f"Saved {len(self.feature_cols)} feature names to {feature_cols_path}")
+        
+        # --- NEW: Save OOF predictions to CSV for analysis ---
+        train_df["oof_pred"] = oof_residuals
+        oof_path = self.artifacts_dir / "oof_preds.csv"
+        # Only save columns necessary for analysis to keep file size small
+        save_cols = ["well_id", "row_index", "target_residual", "oof_pred", "md_from_ps", "z_from_ps"]
+        train_df[save_cols].to_csv(oof_path, index=False)
+        self.logger.info(f"Saved OOF predictions to {oof_path}")
+        # -------------------------------------------------------------------
+        
         return fold_models, oof_residuals, train_df

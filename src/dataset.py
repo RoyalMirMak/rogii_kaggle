@@ -8,7 +8,7 @@ from tqdm import tqdm
 import sys
 
 from src.utils import setup_logger, robust_slope, first_nan_idx
-from src.physics import FormationPlaneKNN, beam_search, self_corr_tvt
+from src.physics import FormationPlaneKNN, DenseANCCImputer, beam_search, self_corr_tvt, multi_scale_ncc, run_pf_ancc
 
 class DatasetBuilder:
     def __init__(self, config):
@@ -38,6 +38,7 @@ class DatasetBuilder:
             self.logger.info(f"[DRY RUN] Limited to {len(train_wells)} training wells")
         
         self.knn = FormationPlaneKNN(train_wells, self.data_dir, self.formations)
+        self.dense_knn = DenseANCCImputer(train_wells, self.data_dir)
 
     def _build_features_for_well(self, wid, split, test_eval_idx=None):
         """Extracts statistical and physical features for a single well's evaluation zone."""
@@ -72,7 +73,7 @@ class DatasetBuilder:
             return pd.DataFrame()
 
         visible = h[h["TVT_input"].notna()].copy()
-        if len(visible) == 10: # Ensure minimum history
+        if len(visible) < 10: # Ensure minimum history
             return pd.DataFrame()
 
         # Last known anchors
@@ -136,40 +137,51 @@ class DatasetBuilder:
                 cur["beam_mean_d"] = 0.0
                 cur["beam_std_d"] = 0.0
                 
-            # Self-Correlation NCC
-            sc_path, sc_score = self_corr_tvt(kgr, vis_TVT, hgr, hw=15, stride=3)
-            if len(sc_path) == len(cur):
-                cur["sc_tvt_d"] = sc_path - last_TVT
-                cur["sc_score"] = sc_score
+            # --- Multi-Scale NCC ---
+            sc_res, sc_ens = multi_scale_ncc(kgr, visible["TVT_input"].values, hgr, hws=(8, 15, 25), stride=3)
+            cur["sc8_d"] = sc_res[0][0] - last_TVT
+            cur["sc15_d"] = sc_res[1][0] - last_TVT
+            cur["sc25_d"] = sc_res[2][0] - last_TVT
+            cur["sc_ens_d"] = sc_ens - last_TVT
+            
+            # --- Particle Filter (CRITICAL PHYSICS LAYER) ---
+            pf_a_pts, pf_a_std = run_pf_ancc(h, tw_tvt, tw_gr)
+            if len(pf_a_pts) == len(cur):
+                cur["pf_ancc_d"] = pf_a_pts - last_TVT
+                cur["pf_ancc_std"] = pf_a_std
             else:
-                cur["sc_tvt_d"] = 0.0
-                cur["sc_score"] = 0.0
+                cur["pf_ancc_d"] = 0.0
+                cur["pf_ancc_std"] = 0.0
         else:
             cur["beam_mean_d"] = 0.0
             cur["beam_std_d"] = 0.0
-            cur["sc_tvt_d"] = 0.0
-            cur["sc_score"] = 0.0
+            cur["sc8_d"] = 0.0
+            cur["sc15_d"] = 0.0
+            cur["sc25_d"] = 0.0
+            cur["sc_ens_d"] = 0.0
+            cur["pf_ancc_d"] = 0.0
+            cur["pf_ancc_std"] = 0.0
 
-        # Spatial Formation Plane Imputation
+        # We keep the Dense ANCC Imputation (because it had 36% importance)
+        # BUT we DELETE the old 0% importance KNN to save compute
         xy_kn = visible[["X", "Y"]].to_numpy()
         xy_ev = cur[["X", "Y"]].to_numpy()
-        form_kn, _ = self.knn.impute(xy_kn, self_wid=wid if split == "train" else None, k=self.config["physics"]["plane_knn_k"])
-        form_ev, knn_dist = self.knn.impute(xy_ev, self_wid=wid if split == "train" else None, k=self.config["physics"]["plane_knn_k"])
-        z_kn = visible["Z"].to_numpy()
-        z_ev = cur["Z"].to_numpy()
-
-        cur["spatial_knn_dist"] = knn_dist
-        import warnings
+        d_ancc = self.dense_knn.impute(xy_ev, self_wid=wid if split == "train" else None)
+        d_kn = self.dense_knn.impute(xy_kn, self_wid=wid if split == "train" else None)
         
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            # Spatial Formation Plane Imputation
-            for fi, fn in enumerate(self.formations):
-                # Calculate physical offset from known data using median
-                b_full = float(np.nanmedian(vis_TVT + z_kn - form_kn[:, fi]))
-                if np.isnan(b_full): b_full = 0.0
-                # Predict hidden TVT using plane geometry
-                cur[f"tvt_knn_{fn}_d"] = (-z_ev + form_ev[:, fi] + b_full) - last_TVT
+        b_vd = vis_TVT + visible["Z"].to_numpy() - d_kn
+        b_d = float(np.median(b_vd)) if len(b_vd) > 0 else 0.0
+        cur["tvt_dense_d"] = (-cur["Z"].values + d_ancc + b_d) - last_TVT
+        
+        # Cross-signal features (High Value!)
+        if has_tw and len(pf_a_pts) == len(cur):
+            cur["pf_vs_dense"] = cur["pf_ancc_d"] - cur["tvt_dense_d"]
+            cur["sc_vs_dense"] = cur["sc_ens_d"] - cur["tvt_dense_d"]
+            cur["pf_vs_beam"] = cur["pf_ancc_d"] - cur["beam_mean_d"]
+        else:
+            cur["pf_vs_dense"] = 0.0
+            cur["sc_vs_dense"] = 0.0
+            cur["pf_vs_beam"] = 0.0
 
         # --- 3. Target Variable Setup ---
         if split == "train":

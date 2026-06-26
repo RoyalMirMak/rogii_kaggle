@@ -15,16 +15,16 @@ training:
 
 model:
   name: "lightgbm"
-  num_boost_round: 2000
-  early_stopping_rounds: 100
+  num_boost_round: 3000
+  early_stopping_rounds: 150
   params:
     objective: "regression"
     metric: "rmse"
     learning_rate: 0.03
-    num_leaves: 63
-    min_data_in_leaf: 200
-    feature_fraction: 0.85
-    bagging_fraction: 0.85
+    num_leaves: 127
+    min_data_in_leaf: 50
+    feature_fraction: 0.75
+    bagging_fraction: 0.8
     bagging_freq: 5
     lambda_l2: 1.0
     verbose: -1
@@ -45,3 +45,12 @@ physics:
     - [8, 35.0, 220.0, 1, "vcons"]
     - [10, 14.0, 90.0, 5, "sm5"]
     - [20, 4.0, 36.0, 3, "vloose"]
+    - [12, 12.0, 100.0, 3, "med1"]
+    - [15, 25.0, 180.0, 2, "wide1"]
+    - [20, 30.0, 200.0, 2, "wide2"]
+    - [15, 10.0, 80.0, 4, "med2"]
+    - [25, 6.0, 50.0, 3, "vloose2"]
+    - [10, 40.0, 300.0, 1, "vwide1"]
+    - [12, 18.0, 120.0, 5, "med3"]
+    - [30, 8.0, 70.0, 2, "vloose3"]
+    - [10, 50.0, 400.0, 0, "vwide2"]
