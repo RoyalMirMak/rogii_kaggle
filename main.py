@@ -11,7 +11,6 @@ from src.data_loader import download_competition_data
 from src.dataset import DatasetBuilder
 from src.train import Trainer
 from src.validate import Validator
-from src.inference import Inferencer
 from src.utils import setup_logger
 
 warnings.filterwarnings("ignore")
@@ -65,10 +64,10 @@ def main():
     logger.info(f"Using Data Directory: {config['paths']['data_dir']}")
 
     # 1. Build Datasets (with parallel processing)
-    logger.info("--- Step 1: Building Datasets ---")
+    # Note: Only build training data - test data is corrupted and should not be used
+    logger.info("--- Step 1: Building Training Datasets ---")
     builder = DatasetBuilder(config)
     train_df, feature_cols = builder.build_train()
-    test_df, sample_sub = builder.build_test()
 
     # 2. Train Models (GroupKFold)
     logger.info("--- Step 2: Training Models ---")
@@ -80,12 +79,9 @@ def main():
     validator = Validator(config)
     validator.evaluate(train_df_used, oof_predictions, fold_models, feature_cols)
 
-    # 4. Inference & Submission
-    logger.info("--- Step 4: Inference ---")
-    inferencer = Inferencer(config)
-    inferencer.predict_and_save(test_df, fold_models, feature_cols, sample_sub)
+    # Note: Inference step removed - test data is corrupted and should not be used
     
-    logger.info("Pipeline completed successfully.")
+    logger.info("Pipeline completed successfully (training and validation only).")
 
 if __name__ == "__main__":
     main()
