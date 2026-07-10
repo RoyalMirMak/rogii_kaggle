@@ -8,8 +8,119 @@ from tqdm import tqdm
 import sys
 
 from src.utils import setup_logger, robust_slope, first_nan_idx
-from src.physics import FormationPlaneKNN, DenseANCCImputer, beam_search, self_corr_tvt, multi_scale_ncc, run_pf_ancc
-from src.physics import multi_scale_ncc, run_pf_ancc, seg_b_well, affine_cal
+from src.physics import (
+    FormationPlaneKNN,
+    DenseANCCImputer,
+    beam_search,
+    self_corr_tvt,
+    multi_scale_ncc,
+    run_pf_ancc,
+    run_pf_z_velocity,
+    seg_b_well,
+    affine_cal,
+)
+
+def _recent_slope(x, y, window, fallback=0.0):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+
+    if len(x) < 3 or len(y) < 3:
+        return float(fallback)
+
+    x = x[-window:]
+    y = y[-window:]
+    valid = np.isfinite(x) & np.isfinite(y)
+
+    if valid.sum() < 3:
+        return float(fallback)
+
+    return robust_slope(x[valid], y[valid])
+
+
+def _nan_run_lengths(values):
+    is_nan = np.isnan(np.asarray(values, dtype=np.float64))
+    result = np.zeros(len(is_nan), dtype=np.float32)
+    run = 0
+
+    for i, flag in enumerate(is_nan):
+        if flag:
+            run += 1
+        else:
+            run = 0
+        result[i] = run
+
+    return result
+
+
+def _add_gr_sequence_features(cur, h, visible, sel_idx, fallback_gr):
+    """
+    Features use the complete horizontal GR trajectory. This is valid because
+    GR is observed in the hidden TVT interval at inference time.
+    """
+    raw_gr = h["GR"].to_numpy(dtype=np.float64)
+    nan_flag = np.isnan(raw_gr).astype(np.float32)
+    nan_streak = _nan_run_lengths(raw_gr)
+
+    filled_gr = (
+        pd.Series(raw_gr)
+        .interpolate(limit_direction="both")
+        .fillna(float(fallback_gr))
+        .to_numpy(dtype=np.float64)
+    )
+    gr_series = pd.Series(filled_gr)
+
+    cur["gr"] = filled_gr[sel_idx].astype(np.float32)
+    cur["gr_nan_flag"] = nan_flag[sel_idx]
+    cur["gr_nan_streak"] = nan_streak[sel_idx]
+
+    for window in (5, 21, 51, 101, 151):
+        cur[f"gr_roll_mean_{window}"] = (
+            gr_series.rolling(window, center=True, min_periods=1).mean().to_numpy()[sel_idx]
+        ).astype(np.float32)
+
+    for window in (5, 21):
+        rolling = gr_series.rolling(window, center=True, min_periods=1)
+        cur[f"gr_roll_std_{window}"] = rolling.std().fillna(0.0).to_numpy()[sel_idx].astype(np.float32)
+        min_values = rolling.min().to_numpy()
+        max_values = rolling.max().to_numpy()
+        cur[f"gr_roll_min_{window}"] = min_values[sel_idx].astype(np.float32)
+        cur[f"gr_roll_max_{window}"] = max_values[sel_idx].astype(np.float32)
+        cur[f"gr_roll_range_{window}"] = (max_values - min_values)[sel_idx].astype(np.float32)
+
+    gradient_1 = gr_series.diff().fillna(0.0).to_numpy(dtype=np.float64)
+    gradient_2 = pd.Series(gradient_1).diff().fillna(0.0).to_numpy(dtype=np.float64)
+    cur["gr_grad_1"] = gradient_1[sel_idx].astype(np.float32)
+    cur["gr_grad_2"] = gradient_2[sel_idx].astype(np.float32)
+
+    for lag in (1, 5, 15, 30):
+        cur[f"gr_lag_{lag}"] = gr_series.shift(lag).bfill().to_numpy()[sel_idx].astype(np.float32)
+        cur[f"gr_lead_{lag}"] = gr_series.shift(-lag).ffill().to_numpy()[sel_idx].astype(np.float32)
+
+    cur["gr_cumsum"] = gr_series.cumsum().to_numpy()[sel_idx].astype(np.float32)
+
+    visible_gr = (
+        visible["GR"]
+        .astype(float)
+        .interpolate(limit_direction="both")
+        .fillna(float(fallback_gr))
+        .to_numpy(dtype=np.float64)
+    )
+    eval_gr = filled_gr[sel_idx]
+
+    prefix_mean = float(np.nanmean(visible_gr))
+    prefix_std = float(np.nanstd(visible_gr))
+    cur["prefix_gr_mean"] = prefix_mean
+    cur["prefix_gr_std"] = prefix_std
+    cur["prefix_gr_last_5"] = float(np.nanmean(visible_gr[-5:]))
+    cur["prefix_gr_last_20"] = float(np.nanmean(visible_gr[-20:]))
+
+    cur["eval_gr_mean"] = float(np.nanmean(eval_gr))
+    cur["eval_gr_std"] = float(np.nanstd(eval_gr))
+    cur["eval_gr_p25"] = float(np.nanquantile(eval_gr, 0.25))
+    cur["eval_gr_p50"] = float(np.nanquantile(eval_gr, 0.50))
+    cur["eval_gr_p75"] = float(np.nanquantile(eval_gr, 0.75))
+    cur["eval_gr_p90"] = float(np.nanquantile(eval_gr, 0.90))
+    cur["eval_gr_vs_prefix"] = float(np.nanmean(eval_gr) - prefix_mean)
 
 class DatasetBuilder:
     def __init__(self, config):
@@ -39,6 +150,7 @@ class DatasetBuilder:
             self.logger.info(f"[DRY RUN] Limited to {len(train_wells)} training wells")
         
         self.knn = FormationPlaneKNN(train_wells, self.data_dir, self.formations)
+        self.formation_knn = self.knn
         self.dense_knn = DenseANCCImputer(train_wells, self.data_dir)
 
     def _build_features_for_well(self, wid, split, test_eval_idx=None):
@@ -114,11 +226,62 @@ class DatasetBuilder:
         cur["z_from_ps"] = cur["Z"].values - last_Z
         cur["dxy_from_ps"] = np.sqrt((cur["X"].values - last_X)**2 + (cur["Y"].values - last_Y)**2)
         cur["slope_TVT_MD_all"] = robust_slope(visible["MD"].values, vis_TVT)
+        cur["slope_TVT_MD_5"] = _recent_slope(
+            visible["MD"].values,
+            vis_TVT,
+            5,
+            cur["slope_TVT_MD_all"].iloc[0],
+        )
+        cur["slope_TVT_MD_10"] = _recent_slope(
+            visible["MD"].values,
+            vis_TVT,
+            10,
+            cur["slope_TVT_MD_all"].iloc[0],
+        )
+        cur["slope_TVT_MD_20"] = _recent_slope(
+            visible["MD"].values,
+            vis_TVT,
+            20,
+            cur["slope_TVT_MD_all"].iloc[0],
+        )
+        cur["slope_TVT_MD_50"] = _recent_slope(
+            visible["MD"].values,
+            vis_TVT,
+            50,
+            cur["slope_TVT_MD_all"].iloc[0],
+        )
+
+        cur["slope_Z_MD_10"] = _recent_slope(
+            visible["MD"].values,
+            visible["Z"].values,
+            10,
+            0.0,
+        )
+        cur["slope_Z_MD_20"] = _recent_slope(
+            visible["MD"].values,
+            visible["Z"].values,
+            20,
+            0.0,
+        )
+
+        cur["hidden_rows"] = len(sel_idx)
+        cur["visible_rows"] = len(visible)
+        cur["hidden_fraction"] = len(sel_idx) / max(len(h), 1)
+        cur["z_span_visible"] = float(
+            np.nanmax(visible["Z"].values) - np.nanmin(visible["Z"].values)
+        )
         
         # --- 2. Physics-Informed Features ---
         if has_tw:
             hgr = cur["GR"].interpolate(limit_direction="both").fillna(np.nanmean(tw_gr)).to_numpy(dtype=np.float32)
             kgr = visible["GR"].interpolate(limit_direction="both").fillna(np.nanmean(tw_gr)).to_numpy(dtype=np.float32)
+            _add_gr_sequence_features(
+                cur=cur,
+                h=h,
+                visible=visible,
+                sel_idx=sel_idx,
+                fallback_gr=float(np.nanmean(tw_gr)),
+            )
             
             # Beam Search
             beams_res = []
@@ -133,8 +296,28 @@ class DatasetBuilder:
             if beams_res:
                 beams_arr = np.stack(beams_res, axis=1)
                 cur["beam_mean_d"] = beams_arr.mean(axis=1) - last_TVT
+                cur["beam_median_d"] = np.median(beams_arr, axis=1) - last_TVT
                 cur["beam_std_d"] = beams_arr.std(axis=1)
+
+                beam_by_tag = {
+                    tag: cur[f"beam_{tag}_d"].to_numpy(dtype=np.float32)
+                    for _, _, _, _, tag in self.config["physics"]["beams"]
+                    if f"beam_{tag}_d" in cur.columns
+                }
+
+                if "vloose" in beam_by_tag and "vcons" in beam_by_tag:
+                    cur["beam_spread_d"] = beam_by_tag["vloose"] - beam_by_tag["vcons"]
+                else:
+                    cur["beam_spread_d"] = 0.0
+
+                if "loose" in beam_by_tag and "cons" in beam_by_tag:
+                    cur["beam_gap_d"] = beam_by_tag["loose"] - beam_by_tag["cons"]
+                else:
+                    cur["beam_gap_d"] = 0.0
             else:
+                cur["beam_median_d"] = 0.0
+                cur["beam_spread_d"] = 0.0
+                cur["beam_gap_d"] = 0.0
                 cur["beam_mean_d"] = 0.0
                 cur["beam_std_d"] = 0.0
                 
@@ -153,7 +336,22 @@ class DatasetBuilder:
             else:
                 cur["pf_ancc_d"] = 0.0
                 cur["pf_ancc_std"] = 0.0
+            pf_z_pts, pf_z_std = run_pf_z_velocity(h, tw_tvt, tw_gr)
+
+            if len(pf_z_pts) == len(cur):
+                cur["pf_z_d"] = pf_z_pts - last_TVT
+                cur["pf_z_std"] = pf_z_std
+            else:
+                cur["pf_z_d"] = 0.0
+                cur["pf_z_std"] = 0.0
         else:
+            _add_gr_sequence_features(
+                cur=cur,
+                h=h,
+                visible=visible,
+                sel_idx=sel_idx,
+                fallback_gr=50.0,
+            )
             cur["beam_mean_d"] = 0.0
             cur["beam_std_d"] = 0.0
             cur["sc8_d"] = 0.0
@@ -162,6 +360,8 @@ class DatasetBuilder:
             cur["sc_ens_d"] = 0.0
             cur["pf_ancc_d"] = 0.0
             cur["pf_ancc_std"] = 0.0
+            cur["pf_z_d"] = 0.0
+            cur["pf_z_std"] = 0.0
 
         # --- Dense ANCC Imputation with Segmented b_well ---
         xy_kn = visible[["X", "Y"]].to_numpy()
@@ -187,8 +387,56 @@ class DatasetBuilder:
             cur["pf_vs_beam"] = cur["pf_ancc_d"] - cur["beam_mean_d"]
         else:
             cur["pf_vs_dense"] = 0.0; cur["sc_vs_dense"] = 0.0; cur["pf_vs_beam"] = 0.0
+
+        if has_tw:
+            cur["pf_z_vs_ancc"] = cur["pf_z_d"] - cur["pf_ancc_d"]
+            cur["pf_z_vs_dense"] = cur["pf_z_d"] - cur["tvt_dense_d"]
+            cur["pf_z_vs_beam"] = cur["pf_z_d"] - cur["beam_mean_d"]
+        else:
+            cur["pf_z_vs_ancc"] = 0.0
+            cur["pf_z_vs_dense"] = 0.0
+            cur["pf_z_vs_beam"] = 0.0
         
                 # --- GR Offset Matrices and Affine Calibration ---
+
+        form_ev, form_ev_dist = self.formation_knn.impute(
+            xy_ev,
+            self_wid=wid if split == "train" else None,
+            k=self.config["physics"]["plane_knn_k"],
+        )
+        form_kn, _ = self.formation_knn.impute(
+            xy_kn,
+            self_wid=wid if split == "train" else None,
+            k=self.config["physics"]["plane_knn_k"],
+        )
+
+        cur["formation_knn_distance"] = form_ev_dist.astype(np.float32)
+
+        for form_index, form_name in enumerate(self.formations):
+            ev_form = form_ev[:, form_index]
+            kn_form = form_kn[:, form_index]
+
+            valid = np.isfinite(kn_form) & np.isfinite(ktvt) & np.isfinite(kz)
+            if valid.sum() >= 10:
+                b_full_form = float(np.nanmedian(ktvt[valid] + kz[valid] - kn_form[valid]))
+
+                recent_mask = valid.copy()
+                recent_indices = np.flatnonzero(valid)[-min(50, valid.sum()):]
+                b_recent_form = float(
+                    np.nanmedian(ktvt[recent_indices] + kz[recent_indices] - kn_form[recent_indices])
+                )
+
+                cur[f"tvt_{form_name}_d"] = (-z_ev + ev_form + b_full_form) - last_TVT
+                cur[f"tvt_{form_name}_recent_d"] = (
+                    -z_ev + ev_form + b_recent_form
+                ) - last_TVT
+                cur[f"b_{form_name}"] = b_full_form
+                cur[f"b_recent_{form_name}"] = b_recent_form
+            else:
+                cur[f"tvt_{form_name}_d"] = 0.0
+                cur[f"tvt_{form_name}_recent_d"] = 0.0
+                cur[f"b_{form_name}"] = 0.0
+                cur[f"b_recent_{form_name}"] = 0.0
         if has_tw:
             # 1. Affine Calibration (Scale and Shift of GR)
             tw_at_k = np.interp(ktvt, tw_tvt, tw_gr).astype(np.float32)

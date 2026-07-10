@@ -344,6 +344,232 @@ def run_pf_ancc(hw, tw_tvt, tw_gr, N=ANCC_N):
                       gs, ls, ir, N, ANCC_ALPHA, ANCC_RN, ANCC_PN, ANCC_IS, ANCC_RP, ANCC_RR, PF_RESAMP)
     return pts.astype(np.float32), std.astype(np.float32)
 
+def _safe_interp(x, xp, fp, fallback=0.0):
+    if len(xp) < 2 or len(fp) < 2:
+        return np.full_like(np.asarray(x, dtype=np.float64), fallback, dtype=np.float64)
+    return np.interp(x, xp, fp, left=fp[0], right=fp[-1])
+
+
+def _estimate_z_velocity(hw):
+    """
+    Learns dTVT/dMD ~= beta * dZ/dMD + intercept from the visible prefix.
+    Returns beta, intercept, residual velocity standard deviation, and
+    a robust recent velocity initialization.
+    """
+    known = hw[hw["TVT_input"].notna()].copy()
+    if len(known) < 30:
+        return -1.0, 0.0, 0.02, 0.0
+
+    md = known["MD"].to_numpy(dtype=np.float64)
+    z = known["Z"].to_numpy(dtype=np.float64)
+    tvt = known["TVT_input"].to_numpy(dtype=np.float64)
+
+    dmd = np.diff(md)
+    dz = np.diff(z)
+    dtvt = np.diff(tvt)
+
+    good = np.isfinite(dmd) & np.isfinite(dz) & np.isfinite(dtvt) & (np.abs(dmd) > 1e-8)
+    if good.sum() < 10:
+        return -1.0, 0.0, 0.02, 0.0
+
+    vz = dz[good] / dmd[good]
+    vt = dtvt[good] / dmd[good]
+
+    design = np.column_stack([vz, np.ones_like(vz)])
+    try:
+        beta, intercept = np.linalg.lstsq(design, vt, rcond=None)[0]
+        residual = vt - (beta * vz + intercept)
+        sigma = max(float(np.nanstd(residual)), 0.002)
+    except np.linalg.LinAlgError:
+        beta, intercept, sigma = -1.0, 0.0, 0.02
+
+    tail = min(30, len(vt))
+    init_velocity = float(np.nanmedian(vt[-tail:])) if tail >= 3 else 0.0
+    return float(beta), float(intercept), float(sigma), init_velocity
+
+
+def _particle_resample(pos, vel, weights, rng, pos_noise=0.15, vel_noise=0.002):
+    n_particles = len(pos)
+    cumulative = np.cumsum(weights)
+    cumulative[-1] = 1.0
+    positions = (rng.random() + np.arange(n_particles)) / n_particles
+    indices = np.searchsorted(cumulative, positions, side="left")
+    pos = pos[indices] + rng.normal(0.0, pos_noise, n_particles)
+    vel = vel[indices] + rng.normal(0.0, vel_noise, n_particles)
+    weights = np.full(n_particles, 1.0 / n_particles, dtype=np.float64)
+    return pos, vel, weights
+
+
+def run_pf_z_velocity(
+    hw,
+    tw_tvt,
+    tw_gr,
+    n_particles=600,
+    momentum=0.993,
+    velocity_noise=0.004,
+    position_noise=0.008,
+    init_position_std=0.50,
+    init_velocity_std=0.015,
+    gr_smooth_window=5,
+    smooth_gr_weight=0.30,
+    seed=42,
+):
+    """
+    Direct-TVT particle filter.
+
+    State:
+        TVT position and dTVT/dMD velocity.
+
+    Transition:
+        Velocity is regularized by the visible-prefix relation between
+        dTVT/dMD and dZ/dMD.
+
+    Observation:
+        Horizontal GR is compared with the typewell GR at each particle's
+        TVT coordinate, using both raw and locally smoothed GR likelihoods.
+
+    Returns
+    -------
+    pf_tvt : np.ndarray
+        Absolute TVT estimate for the hidden/evaluation rows.
+    pf_std : np.ndarray
+        Particle posterior standard deviation for each estimate.
+    """
+    if len(tw_tvt) < 3 or len(tw_gr) < 3:
+        return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+
+    known_mask = hw["TVT_input"].notna().to_numpy()
+    hidden_mask = hw["TVT_input"].isna().to_numpy()
+
+    if known_mask.sum() < 20 or hidden_mask.sum() == 0:
+        return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+
+    known = hw.loc[known_mask]
+    hidden = hw.loc[hidden_mask]
+
+    last_tvt = float(known["TVT_input"].iloc[-1])
+    last_md = float(known["MD"].iloc[-1])
+    last_z = float(known["Z"].iloc[-1])
+
+    beta, intercept, velocity_sigma, init_velocity = _estimate_z_velocity(hw)
+
+    known_gr = known["GR"].to_numpy(dtype=np.float64)
+    known_tvt = known["TVT_input"].to_numpy(dtype=np.float64)
+    expected_known_gr = _safe_interp(known_tvt, tw_tvt, tw_gr, fallback=np.nanmean(tw_gr))
+    residual_gr = known_gr - expected_known_gr
+    finite_gr = np.isfinite(residual_gr)
+
+    if finite_gr.sum() >= 20:
+        gr_sigma = float(np.clip(np.nanstd(residual_gr[finite_gr]), 10.0, 60.0))
+    else:
+        gr_sigma = 30.0
+
+    full_gr = hw["GR"].astype(float).interpolate(limit_direction="both")
+    full_gr = full_gr.fillna(float(np.nanmean(tw_gr)))
+    smooth_gr = full_gr.rolling(
+        gr_smooth_window,
+        center=True,
+        min_periods=1,
+    ).mean().to_numpy(dtype=np.float64)
+
+    hidden_indices = np.flatnonzero(hidden_mask)
+    hidden_md = hw.loc[hidden_mask, "MD"].to_numpy(dtype=np.float64)
+    hidden_z = hw.loc[hidden_mask, "Z"].to_numpy(dtype=np.float64)
+    hidden_gr = full_gr.to_numpy(dtype=np.float64)[hidden_indices]
+    hidden_gr_smooth = smooth_gr[hidden_indices]
+
+    tw_smooth_gr = pd.Series(tw_gr).rolling(
+        gr_smooth_window,
+        center=True,
+        min_periods=1,
+    ).mean().to_numpy(dtype=np.float64)
+
+    rng = np.random.default_rng(seed)
+    pos = last_tvt + rng.normal(0.0, init_position_std, n_particles)
+    vel = init_velocity + rng.normal(0.0, init_velocity_std, n_particles)
+    weights = np.full(n_particles, 1.0 / n_particles, dtype=np.float64)
+
+    pf_tvt = np.zeros(len(hidden), dtype=np.float64)
+    pf_std = np.zeros(len(hidden), dtype=np.float64)
+
+    previous_md = last_md
+    previous_z = last_z
+
+    tvt_min = float(np.nanmin(tw_tvt)) - 80.0
+    tvt_max = float(np.nanmax(tw_tvt)) + 80.0
+
+    for i in range(len(hidden)):
+        current_md = hidden_md[i]
+        current_z = hidden_z[i]
+
+        dmd = max(current_md - previous_md, 1.0)
+        dzdmd = (current_z - previous_z) / dmd
+        expected_velocity = beta * dzdmd + intercept
+
+        vel = (
+            momentum * vel
+            + (1.0 - momentum) * expected_velocity
+            + rng.normal(0.0, velocity_noise, n_particles)
+        )
+        pos = pos + vel * dmd + rng.normal(0.0, position_noise, n_particles)
+        pos = np.clip(pos, tvt_min, tvt_max)
+
+        raw_expected = _safe_interp(pos, tw_tvt, tw_gr, fallback=float(np.nanmean(tw_gr)))
+        smooth_expected = _safe_interp(pos, tw_tvt, tw_smooth_gr, fallback=float(np.nanmean(tw_smooth_gr)))
+
+        if np.isfinite(hidden_gr[i]):
+            raw_likelihood = np.exp(
+                -0.5 * ((hidden_gr[i] - raw_expected) / gr_sigma) ** 2
+            )
+        else:
+            raw_likelihood = np.ones(n_particles, dtype=np.float64)
+
+        if np.isfinite(hidden_gr_smooth[i]):
+            smooth_likelihood = np.exp(
+                -0.5 * ((hidden_gr_smooth[i] - smooth_expected) / (gr_sigma * 1.5)) ** 2
+            )
+        else:
+            smooth_likelihood = np.ones(n_particles, dtype=np.float64)
+
+        velocity_likelihood = np.exp(
+            -0.5 * ((vel - expected_velocity) / max(velocity_sigma * 2.0, 0.005)) ** 2
+        )
+
+        likelihood = (
+            (1.0 - smooth_gr_weight) * raw_likelihood
+            + smooth_gr_weight * smooth_likelihood
+        )
+        weights *= np.maximum(likelihood, 1e-300)
+        weights *= np.maximum(velocity_likelihood, 1e-300)
+
+        weight_sum = weights.sum()
+        if not np.isfinite(weight_sum) or weight_sum <= 1e-300:
+            weights.fill(1.0 / n_particles)
+        else:
+            weights /= weight_sum
+
+        posterior_mean = float(np.average(pos, weights=weights))
+        posterior_std = float(np.sqrt(np.average((pos - posterior_mean) ** 2, weights=weights)))
+
+        pf_tvt[i] = posterior_mean
+        pf_std[i] = posterior_std
+
+        effective_n = 1.0 / np.sum(weights ** 2)
+        if effective_n < 0.50 * n_particles:
+            pos, vel, weights = _particle_resample(
+                pos,
+                vel,
+                weights,
+                rng,
+                pos_noise=0.20,
+                vel_noise=0.003,
+            )
+
+        previous_md = current_md
+        previous_z = current_z
+
+    return pf_tvt.astype(np.float32), pf_std.astype(np.float32)
+
 def multi_scale_ncc(kgr, ktvt, hgr, hws=(8, 15, 25), stride=3):
     out = []
     for hw in hws:

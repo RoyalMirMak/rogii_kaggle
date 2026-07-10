@@ -3,10 +3,16 @@
 paths:
   # Local path. The code will automatically switch to Kaggle paths if it detects them.
   data_dir: "./data"
-  artifacts_dir: "./artifacts"
+  artifacts_dir: .artifacts_pfz_gr
   sample_submission_file: "sample_submission.csv"  # Input template from Kaggle
-  submission_file: "submission.csv"                # Output file for predictions
+  submission_file: submission_pfz_gr.csv
   competition_name: "rogii-wellbore-geology-prediction"
+
+dry_run:
+  enabled: false
+  sample_train_wells: 10
+  sample_test_wells: 2
+  max_rows_per_well: 500
 
 training:
   seed: 42
@@ -37,6 +43,15 @@ physics:
   # Formation Plane KNN configuration
   plane_knn_k: 10
   formations: ["ANCC", "ASTNU", "ASTNL", "EGFDU", "EGFDL", "BUDA"]
+  pf_z:
+    particles: 600
+    momentum: 0.993
+    velocity_noise: 0.004
+    position_noise: 0.008
+    init_position_std: 0.50
+    init_velocity_std: 0.015
+    gr_smooth_window: 5
+    smooth_gr_weight: 0.30
   
   # Beam search configurations: (beam_size, move_cost, emit_scale, smooth_radius, tag)
   beams:
@@ -54,3 +69,11 @@ physics:
     - [12, 18.0, 120.0, 5, "med3"]
     - [30, 8.0, 70.0, 2, "vloose3"]
     - [10, 50.0, 400.0, 0, "vwide2"]
+
+features:
+  enable_pfz: true
+  enable_gr_sequence: true
+  enable_per_formation_tvt: true
+  enable_beam_disagreement: true
+  enable_hidden_gr_summary: true
+  enable_local_velocity: true

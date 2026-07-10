@@ -53,7 +53,7 @@ def main():
     logger.info("Starting ROGII Hybrid Baseline Pipeline")
     
     # 0. Download data if not present (skip on Kaggle)
-    kaggle_path = Path("/kaggle/input/rogii-wellbore-geology-prediction")
+    kaggle_path = Path("data")
     if not kaggle_path.exists():
         data_dir = download_competition_data(
             config["paths"]["data_dir"],
