@@ -412,6 +412,8 @@ class DatasetBuilder:
 
         cur["formation_knn_distance"] = form_ev_dist.astype(np.float32)
 
+        # Formation features - batch via dict to avoid fragmentation
+        form_cols = {}
         for form_index, form_name in enumerate(self.formations):
             ev_form = form_ev[:, form_index]
             kn_form = form_kn[:, form_index]
@@ -426,17 +428,20 @@ class DatasetBuilder:
                     np.nanmedian(ktvt[recent_indices] + kz[recent_indices] - kn_form[recent_indices])
                 )
 
-                cur[f"tvt_{form_name}_d"] = (-z_ev + ev_form + b_full_form) - last_TVT
-                cur[f"tvt_{form_name}_recent_d"] = (
+                form_cols[f"tvt_{form_name}_d"] = (-z_ev + ev_form + b_full_form) - last_TVT
+                form_cols[f"tvt_{form_name}_recent_d"] = (
                     -z_ev + ev_form + b_recent_form
                 ) - last_TVT
-                cur[f"b_{form_name}"] = b_full_form
-                cur[f"b_recent_{form_name}"] = b_recent_form
+                form_cols[f"b_{form_name}"] = b_full_form
+                form_cols[f"b_recent_{form_name}"] = b_recent_form
             else:
-                cur[f"tvt_{form_name}_d"] = 0.0
-                cur[f"tvt_{form_name}_recent_d"] = 0.0
-                cur[f"b_{form_name}"] = 0.0
-                cur[f"b_recent_{form_name}"] = 0.0
+                form_cols[f"tvt_{form_name}_d"] = 0.0
+                form_cols[f"tvt_{form_name}_recent_d"] = 0.0
+                form_cols[f"b_{form_name}"] = 0.0
+                form_cols[f"b_recent_{form_name}"] = 0.0
+
+        form_df = pd.DataFrame(form_cols, index=cur.index)
+        cur = pd.concat([cur, form_df], axis=1)
         if has_tw:
             # 1. Affine Calibration (Scale and Shift of GR)
             tw_at_k = np.interp(ktvt, tw_tvt, tw_gr).astype(np.float32)
@@ -444,41 +449,54 @@ class DatasetBuilder:
             cur["cal_a"] = a_cal
             cur["cal_b"] = b_cal
             
-            # 2. GR Offset Matrices
-            # How much does the well GR deviate from the typewell GR at multiple offsets around our physics predictions?
-            # Note: tdsc_* (NCC offsets) removed - they had 0.00% feature importance
+            # 2. GR Offset Matrices - batch via dict+concat to avoid DataFrame fragmentation
             ANCH_OFFS = [-80, -40, -20, -10, -5, 0, 5, 10, 20, 40, 80]
             BEAM_OFFS = [-40, -20, -10, -5, -3, 0, 3, 5, 10, 20, 40]
             PF_OFFS   = [-30, -15, -8, -4, -2, 0, 2, 4, 8, 15, 30]
 
+            offset_cols = {}
             # Anchor Offsets (around last known TVT)
             for o in ANCH_OFFS:
-                cur[f"tda_{o}"] = hgr - np.interp(last_TVT + o, tw_tvt, tw_gr)
-            
+                offset_cols[f"tda_{o}"] = hgr - np.interp(last_TVT + o, tw_tvt, tw_gr)
+
             # Beam Offsets (around Beam Search Mean)
             beam_ref = cur["beam_mean_d"].values + last_TVT
             for o in BEAM_OFFS:
-                cur[f"tdbc_{o}"] = hgr - np.interp(beam_ref + o, tw_tvt, tw_gr)
-                
+                offset_cols[f"tdbc_{o}"] = hgr - np.interp(beam_ref + o, tw_tvt, tw_gr)
+
             # PF Offsets (around Particle Filter)
             if "pf_ancc_d" in cur and (cur["pf_ancc_d"] != 0).any():
                 pf_ref = cur["pf_ancc_d"].values + last_TVT
                 for o in PF_OFFS:
-                    cur[f"tdpf_{o}"] = hgr - np.interp(pf_ref + o, tw_tvt, tw_gr)
+                    offset_cols[f"tdpf_{o}"] = hgr - np.interp(pf_ref + o, tw_tvt, tw_gr)
             else:
-                for o in PF_OFFS: cur[f"tdpf_{o}"] = 0.0
+                for o in PF_OFFS:
+                    offset_cols[f"tdpf_{o}"] = 0.0
+
+            # Assign all offset columns at once via concat (avoids per-insert fragmentation)
+            offset_df = pd.DataFrame(offset_cols, index=cur.index)
+            cur = pd.concat([cur, offset_df], axis=1)
 
         else:
             cur["cal_a"] = 1.0; cur["cal_b"] = 0.0
-            for o in [-80, -40, -20, -10, -5, 0, 5, 10, 20, 40, 80]: cur[f"tda_{o}"] = 0.0
-            for o in [-40, -20, -10, -5, -3, 0, 3, 5, 10, 20, 40]: cur[f"tdbc_{o}"] = 0.0
-            for o in [-30, -15, -8, -4, -2, 0, 2, 4, 8, 15, 30]: cur[f"tdpf_{o}"] = 0.0
+            # Batch zero-fill offset columns
+            offset_cols = {}
+            for o in [-80, -40, -20, -10, -5, 0, 5, 10, 20, 40, 80]:
+                offset_cols[f"tda_{o}"] = 0.0
+            for o in [-40, -20, -10, -5, -3, 0, 3, 5, 10, 20, 40]:
+                offset_cols[f"tdbc_{o}"] = 0.0
+            for o in [-30, -15, -8, -4, -2, 0, 2, 4, 8, 15, 30]:
+                offset_cols[f"tdpf_{o}"] = 0.0
+            offset_df = pd.DataFrame(offset_cols, index=cur.index)
+            cur = pd.concat([cur, offset_df], axis=1)
 
         # --- 3. Target Variable Setup ---
         if split == "train":
             cur["target_tvt"] = h["TVT"].values[sel_idx]
             cur["target_residual"] = cur["target_tvt"] - last_TVT
 
+        # Defragment DataFrame before return (critical for performance)
+        cur = cur.copy()
         return cur.reset_index(drop=True)
 
     def build_train(self):
