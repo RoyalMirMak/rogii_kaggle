@@ -113,9 +113,21 @@ class Trainer:
         train_df["oof_pred"] = final_oof
         train_df[["well_id", "row_index", "target_residual", "oof_pred_lgb", "oof_pred_cb", "oof_pred", "md_from_ps"]].to_csv(self.artifacts_dir / "oof_preds.csv", index=False)
         
+        # Export OOF for PP tuning with required columns
+        self.logger.info("Exporting OOF predictions for PP tuning...")
+        oof_for_pp = train_df[["well_id", "row_index", "id", "target_tvt", "last_known_TVT"]].copy()
+        oof_for_pp["model_delta"] = final_oof
+        oof_for_pp["pf_ancc_delta"] = train_df.get("pf_ancc_d", 0.0).values if "pf_ancc_d" in train_df.columns else 0.0
+        oof_for_pp["md_from_ps"] = train_df["md_from_ps"].values
+        oof_for_pp["likpf_scale_8_delta"] = 0.0  # placeholder; will be overwritten if lik-PF features exist
+        if "likpf_scale_8_delta" in train_df.columns:
+            oof_for_pp["likpf_scale_8_delta"] = train_df["likpf_scale_8_delta"].values
+        oof_for_pp.to_parquet(self.artifacts_dir / "oof_for_pp_tuning.parquet", index=False)
+        self.logger.info(f"Saved OOF for PP tuning: {self.artifacts_dir / 'oof_for_pp_tuning.parquet'}")
+        
         return {
             "lgbm_models": fold_models_lgb,
             "catboost_models": fold_models_cb,
             "ridge_model": meta_model,
-        }
+        }, final_oof, train_df
 

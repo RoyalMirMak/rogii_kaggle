@@ -157,9 +157,19 @@ class Validator:
 
             for model in fold_models:
                 if hasattr(model, "booster") and model.booster is not None:
-                    importance += model.booster.feature_importance(
+                    booster_importance = model.booster.feature_importance(
                         importance_type="gain"
                     )
+                    # Ensure the importance array length matches feature_cols
+                    if len(booster_importance) == len(feature_cols):
+                        importance += booster_importance
+                    else:
+                        # Fallback: use feature names to align importance
+                        booster_names = model.booster.feature_name()
+                        for i, name in enumerate(booster_names):
+                            if name in feature_cols:
+                                idx = feature_cols.index(name)
+                                importance[idx] += booster_importance[i]
 
             if len(fold_models) > 0:
                 importance /= len(fold_models)
