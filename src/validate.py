@@ -3,6 +3,7 @@ import pandas as pd
 from pathlib import Path
 
 from src.utils import setup_logger
+from src.hybrid import HybridEnsemble
 
 
 class Validator:

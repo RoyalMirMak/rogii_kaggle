@@ -35,9 +35,7 @@ model:
     lambda_l2: 1.0
     verbose: -1
     seed: 42
-    device_type: "gpu"
-    gpu_platform_id: 0
-    gpu_device_id: 0
+    device_type: "cpu"
 
 physics:
   # Formation Plane KNN configuration
