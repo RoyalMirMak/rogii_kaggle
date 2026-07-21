@@ -59,7 +59,7 @@ class LGBMWrapper:
             valid_sets=[dtrain, dvalid],
             valid_names=["train", "valid"],
             callbacks=[
-                lgb.early_stopping(self.early_stopping_rounds, verbose=False),
+                lgb.early_stopping(self.early_stopping_rounds, verbose=True),
                 lgb.log_evaluation(period=eval_period)
             ],
         )

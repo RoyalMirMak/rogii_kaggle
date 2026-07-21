@@ -113,9 +113,5 @@ class Trainer:
         train_df["oof_pred"] = final_oof
         train_df[["well_id", "row_index", "target_residual", "oof_pred_lgb", "oof_pred_cb", "oof_pred", "md_from_ps"]].to_csv(self.artifacts_dir / "oof_preds.csv", index=False)
         
-        return {
-            "lgbm_models": fold_models_lgb,
-            "catboost_models": fold_models_cb,
-            "ridge_model": meta_model,
-        }
+        return fold_models_lgb, final_oof, train_df
 
