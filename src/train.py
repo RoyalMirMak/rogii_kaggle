@@ -28,11 +28,15 @@ class Trainer:
         self.logger.info(f"Starting {self.n_folds}-fold GroupKFold training.")
         self.logger.info(f"Total samples: {len(train_df)}, Features: {len(self.feature_cols)}")
         
-        # Sample data for dry run
+        # Sample data for dry run - limit by number of wells, not samples
         if self.dry_run_enabled:
-            sample_size = min(100, len(train_df))
-            train_df = train_df.iloc[:sample_size].reset_index(drop=True)
-            self.logger.info(f"[DRY RUN] Limited training data to {sample_size} samples")
+            # Get unique wells and take first n_wells (use n_folds + 1 to ensure enough splits)
+            unique_wells = train_df['well_id'].unique()
+            n_wells_needed = max(self.n_folds + 1, 5)  # At least n_folds+1 wells, minimum 5
+            n_wells_needed = min(n_wells_needed, len(unique_wells))
+            selected_wells = unique_wells[:n_wells_needed]
+            train_df = train_df[train_df['well_id'].isin(selected_wells)].reset_index(drop=True)
+            self.logger.info(f"[DRY RUN] Limited training data to {n_wells_needed} wells ({len(train_df)} samples)")
         
         X = train_df[self.feature_cols].astype(np.float32).values
         y = train_df["target_residual"].astype(np.float32).values

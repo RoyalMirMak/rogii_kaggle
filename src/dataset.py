@@ -6,7 +6,6 @@ from pathlib import Path
 from joblib import Parallel, delayed
 from tqdm import tqdm
 import sys
-from typing import Optional, Tuple
 
 from src.utils import setup_logger, robust_slope, first_nan_idx
 from src.physics import (
@@ -20,56 +19,6 @@ from src.physics import (
     seg_b_well,
     affine_cal,
 )
-
-
-def _run_pf_z_velocity_calibrated(
-    hw: pd.DataFrame,
-    tw_tvt: np.ndarray,
-    tw_gr: np.ndarray,
-    calibration_params: Optional[Tuple[float, float]] = None,
-    **pf_kwargs
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Run PF with optionally calibrated horizontal GR.
-    
-    Parameters:
-    -----------
-    calibration_params : (a, b) or None
-        If provided, apply kgr_cal = a * kgr_raw + b before PF
-    """
-    if calibration_params is not None:
-        a, b = calibration_params
-        # Create a copy with calibrated GR
-        hw_cal = hw.copy()
-        hw_cal['GR'] = a * hw['GR'] + b
-        return run_pf_z_velocity(hw_cal, tw_tvt, tw_gr, **pf_kwargs)
-    else:
-        return run_pf_z_velocity(hw, tw_tvt, tw_gr, **pf_kwargs)
-
-
-def _run_pf_ancc_calibrated(
-    hw: pd.DataFrame,
-    tw_tvt: np.ndarray,
-    tw_gr: np.ndarray,
-    calibration_params: Optional[Tuple[float, float]] = None,
-    **pf_kwargs
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Run PF-ANCC with optionally calibrated horizontal GR.
-    
-    Parameters:
-    -----------
-    calibration_params : (a, b) or None
-        If provided, apply kgr_cal = a * kgr_raw + b before PF
-    """
-    if calibration_params is not None:
-        a, b = calibration_params
-        # Create a copy with calibrated GR
-        hw_cal = hw.copy()
-        hw_cal['GR'] = a * hw['GR'] + b
-        return run_pf_ancc(hw_cal, tw_tvt, tw_gr, **pf_kwargs)
-    else:
-        return run_pf_ancc(hw, tw_tvt, tw_gr, **pf_kwargs)
 
 def _recent_slope(x, y, window, fallback=0.0):
     x = np.asarray(x, dtype=np.float64)
@@ -304,9 +253,6 @@ class DatasetBuilder:
         cur = pd.concat([cur, basic_df], axis=1)
         
         # --- 2. Physics-Informed Features ---
-        # Prepare common variables needed for physics features
-        ktvt = visible["TVT_input"].to_numpy(dtype=np.float32)
-        
         if has_tw:
             hgr = cur["GR"].interpolate(limit_direction="both").fillna(np.nanmean(tw_gr)).to_numpy(dtype=np.float32)
             kgr = visible["GR"].interpolate(limit_direction="both").fillna(np.nanmean(tw_gr)).to_numpy(dtype=np.float32)
@@ -362,7 +308,7 @@ class DatasetBuilder:
             cur = pd.concat([cur, beam_df], axis=1)
                 
             # --- Multi-Scale NCC - batch via dict+concat
-            sc_res, sc_ens = multi_scale_ncc(kgr, ktvt, hgr, hws=(8, 15, 25), stride=3)
+            sc_res, sc_ens = multi_scale_ncc(kgr, visible["TVT_input"].values, hgr, hws=(8, 15, 25), stride=3)
             sc_cols = {
                 "sc8_d": sc_res[0][0] - last_TVT,
                 "sc15_d": sc_res[1][0] - last_TVT,
@@ -373,18 +319,8 @@ class DatasetBuilder:
             cur = pd.concat([cur, sc_df], axis=1)
             
             # --- Particle Filter (CRITICAL PHYSICS LAYER) - batch via dict+concat
-            # First, get calibration parameters
-            tw_at_k = np.interp(ktvt, tw_tvt, tw_gr).astype(np.float32)
-            a_cal, b_cal = affine_cal(kgr, tw_at_k)
-            calibration_params = (a_cal, b_cal)
-            
-            # Run both raw and calibrated PF
             pf_a_pts, pf_a_std = run_pf_ancc(h, tw_tvt, tw_gr)
             pf_z_pts, pf_z_std = run_pf_z_velocity(h, tw_tvt, tw_gr)
-            
-            # A1 Experiment: Calibrated PF (GR calibration before PF inference)
-            pf_a_cal_pts, pf_a_cal_std = _run_pf_ancc_calibrated(h, tw_tvt, tw_gr, calibration_params)
-            pf_z_cal_pts, pf_z_cal_std = _run_pf_z_velocity_calibrated(h, tw_tvt, tw_gr, calibration_params)
             
             pf_cols = {}
             if len(pf_a_pts) == len(cur):
@@ -400,57 +336,6 @@ class DatasetBuilder:
             else:
                 pf_cols["pf_z_d"] = 0.0
                 pf_cols["pf_z_std"] = 0.0
-            
-            # A1: Add calibrated PF features
-            if len(pf_a_cal_pts) == len(cur):
-                pf_cols["pf_ancc_cal_d"] = (pf_a_cal_pts - last_TVT).astype(np.float32)
-                pf_cols["pf_ancc_cal_std"] = pf_a_cal_std.astype(np.float32)
-            else:
-                pf_cols["pf_ancc_cal_d"] = 0.0
-                pf_cols["pf_ancc_cal_std"] = 0.0
-            
-            if len(pf_z_cal_pts) == len(cur):
-                pf_cols["pf_z_cal_d"] = (pf_z_cal_pts - last_TVT).astype(np.float32)
-                pf_cols["pf_z_cal_std"] = pf_z_cal_std.astype(np.float32)
-            else:
-                pf_cols["pf_z_cal_d"] = 0.0
-                pf_cols["pf_z_cal_std"] = 0.0
-            
-            # Multi-seed PF (S-Tier): Likelihood-weighted aggregation (S1 v2 successful approach)
-            # LOADED FROM PRE-COMPUTED FEATURES for efficiency
-            # Using 8 seeds, 400 particles, T=3.0 (best from S1 v2 experiments)
-            try:
-                from src.candidates import MultiSeedLikelihoodPFAggregator
-                visible = h[h["TVT_input"].notna()].copy()
-                if len(visible) >= 20:
-                    ms_pf_agg = MultiSeedLikelihoodPFAggregator(
-                        n_seeds=8,
-                        n_particles=400,
-                        temperature=3.0,  # Best temperature from S1 v2
-                        base_seed=42,
-                        momentum=0.993,
-                        velocity_noise=0.004,
-                        position_noise=0.008,
-                    )
-                    ms_pf_agg.fit(visible, tw_tvt, tw_gr)
-                    tvt_pred, uncertainty = ms_pf_agg.predict(cur)
-                    pf_cols["pf_multiseed_lw_d"] = (tvt_pred - last_TVT).astype(np.float32)
-                    pf_cols["pf_multiseed_lw_std"] = uncertainty.astype(np.float32)
-                    # Add additional diagnostic features from metadata
-                    metadata = ms_pf_agg.get_metadata()
-                    pf_cols["pf_multiseed_effective_seeds"] = float(metadata.get('effective_seeds', 8))
-                    pf_cols["pf_multiseed_spread"] = np.std(tvt_pred - pf_z_pts).astype(np.float32)
-                else:
-                    pf_cols["pf_multiseed_lw_d"] = 0.0
-                    pf_cols["pf_multiseed_lw_std"] = 0.0
-                    pf_cols["pf_multiseed_effective_seeds"] = 0.0
-                    pf_cols["pf_multiseed_spread"] = 0.0
-            except Exception as e:
-                # Fallback to single-seed PF if multi-seed fails
-                pf_cols["pf_multiseed_lw_d"] = pf_cols.get("pf_z_d", 0.0)
-                pf_cols["pf_multiseed_lw_std"] = pf_cols.get("pf_z_std", 0.0)
-                pf_cols["pf_multiseed_effective_seeds"] = 0.0
-                pf_cols["pf_multiseed_spread"] = 0.0
             
             pf_df = pd.DataFrame(pf_cols, index=cur.index)
             cur = pd.concat([cur, pf_df], axis=1)
@@ -476,10 +361,6 @@ class DatasetBuilder:
                 "pf_ancc_std": 0.0,
                 "pf_z_d": 0.0,
                 "pf_z_std": 0.0,
-                "pf_ancc_cal_d": 0.0,
-                "pf_ancc_cal_std": 0.0,
-                "pf_z_cal_d": 0.0,
-                "pf_z_cal_std": 0.0,
             }
             physics_zero_df = pd.DataFrame(physics_zero_cols, index=cur.index)
             cur = pd.concat([cur, physics_zero_df], axis=1)
@@ -490,6 +371,7 @@ class DatasetBuilder:
         d_ancc = self.dense_knn.impute(xy_ev, self_wid=wid if split == "train" else None)
         d_kn = self.dense_knn.impute(xy_kn, self_wid=wid if split == "train" else None)
         
+        ktvt = visible["TVT_input"].to_numpy(dtype=np.float32)
         kz = visible["Z"].to_numpy(dtype=np.float32)
         z_ev = cur["Z"].to_numpy(dtype=np.float32)
 
@@ -653,36 +535,23 @@ class DatasetBuilder:
                 if len(result) > 0:
                     dfs.append(result)
         else:
-            # Parallel processing with multiprocessing backend (more stable than loky for this workload)
-            # Process in small chunks to show progress
-            chunk_size = max(1, total // 20)  # Show ~20 progress updates
-            self.logger.info(f"Starting parallel processing: {total} wells in chunks of {chunk_size} with {self.n_jobs} workers")
+            # Parallel processing - process ALL wells at once for maximum efficiency
+            self.logger.info(f"Starting parallel processing: {total} wells with {self.n_jobs} workers")
             self.logger.info(f"First 5 wells: {train_wells[:5]}")
             sys.stdout.flush()
             
-            for chunk_start in range(0, total, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, total)
-                chunk_wells = train_wells[chunk_start:chunk_end]
-                
-                self.logger.debug(f"Processing chunk {chunk_start//chunk_size + 1}: wells {chunk_start}-{chunk_end-1}")
-                sys.stdout.flush()
-                
-                # Process chunk in parallel (uses default 'loky' backend which is safer for heavy memory operations)
-                chunk_dfs = Parallel(
-                    n_jobs=self.n_jobs, 
-                    verbose=10
-                )(
-                    delayed(self._build_features_for_well)(wid, "train") for wid in chunk_wells
-                )
-                dfs.extend([d for d in chunk_dfs if len(d) > 0])
-                
-                # Log progress
-                elapsed_chunk = time.time() - t0
-                processed = chunk_end
-                progress = 100.0 * processed / total
-                wells_per_sec = processed / max(elapsed_chunk, 0.1)
-                self.logger.info(f"✓ Progress: {processed}/{total} wells ({progress:.1f}%) - {wells_per_sec:.1f} wells/sec")
-                sys.stdout.flush()
+            # Process all wells in parallel (loky backend for memory safety)
+            dfs = Parallel(
+                n_jobs=self.n_jobs, 
+                verbose=10
+            )(
+                delayed(self._build_features_for_well)(wid, "train") for wid in train_wells
+            )
+            dfs = [d for d in dfs if len(d) > 0]
+            
+            elapsed = time.time() - t0
+            self.logger.info(f"✓ Completed {len(dfs)}/{total} wells in {elapsed:.1f}s ({len(dfs)/max(elapsed, 0.1):.1f} wells/sec)")
+            sys.stdout.flush()
         
         train_df = pd.concat([d for d in dfs if len(d) > 0], ignore_index=True)
         elapsed = time.time() - t0
@@ -731,35 +600,23 @@ class DatasetBuilder:
                 if len(result) > 0:
                     dfs.append(result)
         else:
-            # Parallel processing with multiprocessing backend (more stable than loky)
-            chunk_size = max(1, total // 20)  # Show ~20 progress updates
-            self.logger.info(f"Starting parallel processing: {total} test wells in chunks of {chunk_size} with {self.n_jobs} workers")
+            # Parallel processing - process ALL wells at once for maximum efficiency
+            self.logger.info(f"Starting parallel processing: {total} test wells with {self.n_jobs} workers")
             self.logger.info(f"First 5 test wells: {test_wells[:5]}")
             sys.stdout.flush()
             
-            for chunk_start in range(0, total, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, total)
-                chunk_wells = test_wells[chunk_start:chunk_end]
-                
-                self.logger.debug(f"Processing test chunk {chunk_start//chunk_size + 1}: wells {chunk_start}-{chunk_end-1}")
-                sys.stdout.flush()
-                
-                # Process chunk in parallel (uses default 'loky' backend which is safer for heavy memory operations)
-                chunk_dfs = Parallel(
-                    n_jobs=self.n_jobs, 
-                    verbose=10
-                )(
-                    delayed(self._build_features_for_well)(wid, "test", test_eval_index.get(wid)) for wid in chunk_wells
-                )
-                dfs.extend([d for d in chunk_dfs if len(d) > 0])
-                
-                # Log progress
-                elapsed_chunk = time.time() - t0
-                processed = chunk_end
-                progress = 100.0 * processed / total
-                wells_per_sec = processed / max(elapsed_chunk, 0.1)
-                self.logger.info(f"✓ Progress: {processed}/{total} test wells ({progress:.1f}%) - {wells_per_sec:.1f} wells/sec")
-                sys.stdout.flush()
+            # Process all wells in parallel (loky backend for memory safety)
+            dfs = Parallel(
+                n_jobs=self.n_jobs, 
+                verbose=10
+            )(
+                delayed(self._build_features_for_well)(wid, "test", test_eval_index.get(wid)) for wid in test_wells
+            )
+            dfs = [d for d in dfs if len(d) > 0]
+            
+            elapsed = time.time() - t0
+            self.logger.info(f"✓ Completed {len(dfs)}/{total} test wells in {elapsed:.1f}s ({len(dfs)/max(elapsed, 0.1):.1f} wells/sec)")
+            sys.stdout.flush()
         
         test_df = pd.concat([d for d in dfs if len(d) > 0], ignore_index=True) if dfs else pd.DataFrame()
         elapsed = time.time() - t0

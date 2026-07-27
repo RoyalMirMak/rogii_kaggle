@@ -18,6 +18,9 @@ training:
   seed: 42
   n_folds: 5
   n_jobs: 15  # Sequential processing to avoid multiprocessing deadlock
+  # Memory-efficient training
+  use_subset: true
+  subset_ratio: 0.8
 
 model:
   name: "lightgbm"
@@ -27,15 +30,17 @@ model:
     objective: "regression"
     metric: "rmse"
     learning_rate: 0.03
-    num_leaves: 127
-    min_data_in_leaf: 50
-    feature_fraction: 0.75
-    bagging_fraction: 0.8
+    num_leaves: 63
+    min_data_in_leaf: 100
+    feature_fraction: 0.6
+    bagging_fraction: 0.7
     bagging_freq: 5
     lambda_l2: 1.0
     verbose: -1
     seed: 42
-    device_type: "cpu"
+    device_type: "gpu"
+    gpu_platform_id: 0
+    gpu_device_id: 0
 
 physics:
   # Formation Plane KNN configuration

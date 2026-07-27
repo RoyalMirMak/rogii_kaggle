@@ -77,7 +77,17 @@ def main():
     # 3. Validate (Calculate OOF RMSE on actual TVT)
     logger.info("--- Step 3: Validation ---")
     validator = Validator(config)
-    validator.evaluate(train_df_used, oof_predictions, fold_models, feature_cols)
+    baseline_result = validator.evaluate(train_df_used, oof_predictions, fold_models, feature_cols)
+    
+    # 4. Evaluate with Visible-Prefix Candidate Selection
+    logger.info("--- Step 4: Prefix Selection Evaluation ---")
+    prefix_result = validator.evaluate_with_prefix_selection(
+        train_df=train_df_used,
+        oof_residuals=oof_predictions,
+        fold_models=fold_models,
+        feature_cols=feature_cols,
+        min_gain=0.5
+    )
 
     # Note: Inference step removed - test data is corrupted and should not be used
     

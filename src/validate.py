@@ -4,6 +4,7 @@ from pathlib import Path
 
 from src.utils import setup_logger
 from src.hybrid import HybridEnsemble
+from src.prefix_selector import apply_prefix_selection_to_oof
 
 
 class Validator:
@@ -206,4 +207,103 @@ class Validator:
             "by_hidden_length": by_hidden_length,
             "by_distance": by_distance,
             "feature_importance": importance_df,
+        }
+
+    def evaluate_with_prefix_selection(
+        self,
+        train_df,
+        oof_residuals,
+        fold_models,
+        feature_cols,
+        min_gain=0.5,
+        blend='hard'
+    ):
+        """
+        Evaluate OOF predictions with visible-prefix candidate selection.
+        
+        This method applies the prefix selector as a post-processing step
+        to improve predictions on the hidden evaluation zone.
+        
+        Parameters:
+        -----------
+        train_df : Training DataFrame
+        oof_residuals : OOF residuals from ML model
+        fold_models : Trained fold models
+        feature_cols : Feature column names
+        min_gain : Minimum RMSE improvement to prefer candidate
+        blend : 'hard' (select one) or 'soft' (weighted blend)
+        
+        Returns:
+        --------
+        results : Dict with baseline and corrected metrics
+        """
+        self.logger.info("Evaluating OOF with visible-prefix candidate selection")
+        
+        # Get formations from config
+        formations = self.config.get("physics", {}).get("formations", [
+            'ANCC', 'ASTNU', 'ASTNL', 'EGFDU', 'EGFDL', 'BUDA'
+        ])
+        
+        train_dir = Path(self.config["paths"]["data_dir"]) / "train"
+        
+        # First, get baseline ML predictions
+        baseline_result = self.evaluate(train_df, oof_residuals, fold_models, feature_cols)
+        
+        # Apply prefix selection
+        corrected_oof, well_log = apply_prefix_selection_to_oof(
+            train_df=train_df,
+            oof_predictions=oof_residuals,
+            formations=formations,
+            train_dir=train_dir,
+            min_gain=min_gain
+        )
+        
+        # Evaluate corrected OOF
+        result = train_df.copy()
+        result["oof_residual"] = np.asarray(corrected_oof, dtype=np.float64)
+        result["prediction_tvt"] = result["last_known_TVT"] + result["oof_residual"]
+        
+        corrected_rmse = self._rmse(result["target_tvt"], result["prediction_tvt"])
+        
+        self.logger.info("--- Prefix Selection Results ---")
+        self.logger.info(f"Baseline OOF RMSE:      {baseline_result['oof_rmse']:.5f}")
+        self.logger.info(f"Corrected OOF RMSE:     {corrected_rmse:.5f}")
+        self.logger.info(f"Improvement:            {baseline_result['oof_rmse'] - corrected_rmse:.5f}")
+        
+        # Analyze selection patterns
+        n_wells = len(well_log)
+        n_candidate = (well_log['selection'] == 'candidate').sum()
+        n_ml = (well_log['selection'] == 'ml').sum()
+        
+        self.logger.info(f"Wells using candidate:  {n_candidate} ({100*n_candidate/n_wells:.1f}%)")
+        self.logger.info(f"Wells using ML:         {n_ml} ({100*n_ml/n_wells:.1f}%)")
+        
+        # Most selected candidates
+        candidate_counts = well_log[well_log['best_candidate'].notna()]['best_candidate'].value_counts()
+        self.logger.info("Top candidates selected:")
+        for cand, count in candidate_counts.head(10).items():
+            self.logger.info(f"  {cand}: {count} wells")
+        
+        # Gain distribution
+        valid_gains = well_log[well_log['gain'].notna()]['gain']
+        if len(valid_gains) > 0:
+            self.logger.info(f"Gain distribution: mean={valid_gains.mean():.3f}, "
+                           f"std={valid_gains.std():.3f}, median={valid_gains.median():.3f}")
+        
+        # Save detailed log
+        well_log.to_csv(
+            self.artifacts_dir / "prefix_selection_well_log.csv",
+            index=False
+        )
+        self.logger.info(f"Saved well log to {self.artifacts_dir / 'prefix_selection_well_log.csv'}")
+        
+        return {
+            "baseline_oof_rmse": baseline_result['oof_rmse'],
+            "corrected_oof_rmse": corrected_rmse,
+            "improvement": baseline_result['oof_rmse'] - corrected_rmse,
+            "well_log": well_log,
+            "n_candidate_wells": n_candidate,
+            "n_ml_wells": n_ml,
+            "candidate_counts": candidate_counts,
+            **baseline_result
         }
